@@ -86,7 +86,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             await client.aclose()
 
     app = FastAPI(
-        title="Auto Project â€“ Jira Dashboard API",
+        title="Team Automation â€“ Jira Dashboard API",
         version=settings.version,
         lifespan=lifespan,
         docs_url=None if settings.is_production else "/docs",

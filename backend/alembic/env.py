@@ -13,6 +13,11 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from app.core.config import get_settings
 from app.models import Base, Ticket, SyncState  # noqa: F401
 
+from app.models.base import Base
+from app.models.user import User
+
+target_metadata = Base.metadata
+
 config = context.config
 
 if config.config_file_name is not None:

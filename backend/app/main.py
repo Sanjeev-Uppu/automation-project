@@ -23,6 +23,7 @@ from app.schemas.models import ErrorBody, ErrorResponse
 from app.services.jira_service import JiraService
 from app.services.ticket_sync_service import TicketSyncService
 from app.services.testing_dashboard_service import TestingDashboardService
+from app.routes.auth_routes import router as auth_router
 
 logger = logging.getLogger("app")
 
@@ -40,6 +41,7 @@ def _error(
             hint=hint,
         )
     )
+
     return JSONResponse(
         status_code=status,
         content=body.model_dump(mode="json"),
@@ -80,8 +82,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "Database features are unavailable."
                 )
 
-            # Initialize the Testing Dashboard sync service
-            # only after the database has been initialized.
+            # Initialize the Testing Dashboard services.
             app.state.ticket_sync_service = (
                 TicketSyncService(client, database)
                 if database is not None
@@ -89,10 +90,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
 
             app.state.testing_dashboard_service = (
-    TestingDashboardService(database)
-    if database is not None
-    else None
-)
+                TestingDashboardService(database)
+                if database is not None
+                else None
+            )
 
             if app.state.ticket_sync_service is not None:
                 logger.info(
@@ -127,8 +128,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
             await client.aclose()
 
+    # Create the FastAPI application first.
     app = FastAPI(
-        title="Auto Project – Jira Dashboard API",
+        title="Team Automation – Jira Dashboard API",
         version=settings.version,
         lifespan=lifespan,
         docs_url=None if settings.is_production else "/docs",
@@ -138,11 +140,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app.state.settings = settings
 
+    # Configure CORS for frontend authentication cookies.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=list(settings.frontend_origins),
+        allow_credentials=True,
         allow_methods=["GET", "POST", "OPTIONS"],
-        allow_headers=["Content-Type"],
+        allow_headers=[
+            "Accept",
+            "Content-Type",
+            "X-CSRF-Token",
+        ],
         expose_headers=[
             "Content-Disposition",
             "X-Row-Count",
@@ -225,12 +233,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "Check the backend logs for details.",
         )
 
+    # Register existing Jira API routes.
     app.include_router(router, prefix="/api")
 
+    # Preserve the existing versioned API routes.
     app.include_router(
         router,
         prefix="/api/v1",
         include_in_schema=False,
+    )
+
+    # Register authentication routes AFTER creating the app.
+    app.include_router(
+        auth_router,
+        prefix="/api",
     )
 
     return app
