@@ -1,0 +1,3040 @@
+﻿
+========== app/main.py ==========
+
+"""FastAPI application factory."""
+from __future__ import annotations
+
+import logging
+import time
+import uuid
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+
+from app.api.routes import router
+from app.core.cache import TTLCache
+from app.core.config import Settings, get_settings
+from app.core.database import Database
+from app.core.errors import AppError
+from app.core.logging import configure_logging
+from app.integrations.jira_client import JiraClient
+from app.schemas.models import ErrorBody, ErrorResponse
+from app.services.jira_service import JiraService
+
+logger = logging.getLogger("app")
+
+
+def _error(status: int, code: str, message: str, hint: str | None = None) -> JSONResponse:
+    body = ErrorResponse(error=ErrorBody(code=code, message=message, hint=hint))
+    return JSONResponse(status_code=status, content=body.model_dump(mode="json"))
+
+
+def create_app(settings: Settings | None = None) -> FastAPI:
+    settings = settings or get_settings()
+    configure_logging(settings.log_level, settings.is_production)
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        client = JiraClient(settings)
+        database = None
+
+        app.state.client = client
+        app.state.service = JiraService(
+            settings,
+            client,
+            TTLCache(settings.cache_ttl_seconds),
+        )
+
+        try:
+            # Initialize PostgreSQL only when DATABASE_URL is configured.
+            if settings.database_url:
+                database = Database(settings.database_url)
+                app.state.database = database
+                logger.info("PostgreSQL database pool initialized.")
+            else:
+                app.state.database = None
+                logger.warning(
+                    "DATABASE_URL is not configured. "
+                    "Database features are unavailable."
+                )
+
+            problems = settings.config_problems()
+
+            if problems:
+                logger.warning(
+                    "Jira is not configured: %s",
+                    "; ".join(problems),
+                )
+            else:
+                logger.info(
+                    "Jira site %s, projects %s",
+                    settings.jira_host,
+                    ",".join(settings.jira_project_keys),
+                )
+
+            yield
+
+        finally:
+            # Close PostgreSQL connections before closing the application.
+            if database is not None:
+                await database.close()
+                logger.info("PostgreSQL database pool closed.")
+
+            await client.aclose()
+
+    app = FastAPI(
+        title="Auto Project â€“ Jira Dashboard API",
+        version=settings.version,
+        lifespan=lifespan,
+        docs_url=None if settings.is_production else "/docs",
+        redoc_url=None,
+        openapi_url=None if settings.is_production else "/openapi.json",
+    )
+    app.state.settings = settings
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=list(settings.frontend_origins),
+        allow_methods=["GET", "OPTIONS"],
+        allow_headers=["Content-Type"],
+        expose_headers=["Content-Disposition", "X-Row-Count"],
+    )
+
+    @app.middleware("http")
+    async def request_context(request: Request, call_next):
+        started = time.perf_counter()
+        request_id = uuid.uuid4().hex[:12]
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        if request.url.path.startswith("/api"):
+            response.headers["Cache-Control"] = "no-store"
+        logger.info(
+            "%s %s -> %s",
+            request.method,
+            request.url.path,
+            response.status_code,
+            extra={
+                "ctx": {
+                    "request_id": request_id,
+                    "duration_ms": round(
+                        (time.perf_counter() - started) * 1000
+                    ),
+                }
+            },
+        )
+        return response
+
+    @app.exception_handler(AppError)
+    async def app_error_handler(_: Request, exc: AppError):
+        return _error(
+            exc.status_code,
+            exc.code,
+            exc.message,
+            exc.hint,
+        )
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_handler(_: Request, exc: RequestValidationError):
+        first = exc.errors()[0] if exc.errors() else {}
+        where = ".".join(
+            str(p) for p in first.get("loc", []) if p != "query"
+        )
+        return _error(
+            422,
+            "invalid_parameter",
+            f"Invalid parameter '{where}': "
+            f"{first.get('msg', 'invalid value')}.",
+        )
+
+    @app.exception_handler(Exception)
+    async def unhandled_handler(_: Request, exc: Exception):
+        logger.exception("Unhandled error")  # traceback goes to logs only
+        return _error(
+            500,
+            "internal_error",
+            "Something went wrong on the server.",
+            "Check the backend logs for details.",
+        )
+
+    app.include_router(router, prefix="/api")
+    app.include_router(router, prefix="/api/v1", include_in_schema=False)
+
+    return app
+
+
+app = create_app()  # uvicorn app.main:app
+
+
+========== app/api/routes.py ==========
+"""HTTP routes. All endpoints are read-only (GET)."""
+from __future__ import annotations
+
+from datetime import date
+from typing import Literal
+
+from fastapi import APIRouter, Depends, Query, Request
+from fastapi.responses import JSONResponse, Response
+
+from app.core.errors import InvalidParameter
+from app.schemas.models import (
+    DashboardResponse,
+    HealthResponse,
+    Issue,
+    IssuePage,
+    ProjectsResponse,
+    ProjectSummary,
+    ReadinessResponse,
+    StatusesResponse,
+)
+from app.services.jira_service import JiraService
+from app.services.jql import IssueFilters
+
+router = APIRouter()
+
+
+def get_service(request: Request) -> JiraService:
+    return request.app.state.service
+
+
+def _clean(value: str | None) -> str | None:
+    value = value.strip() if value else None
+    return value or None
+
+
+def _date(name: str, value: str | None) -> date | None:
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise InvalidParameter(f"{name} must be a date in YYYY-MM-DD format.") from exc
+
+
+def get_filters(
+    status: str | None = Query(None, max_length=255),
+    search: str | None = Query(None, max_length=200),
+    assignee: str | None = Query(None, max_length=128, description="Jira account id or __unassigned__"),
+    issue_type: str | None = Query(None, max_length=255),
+    priority: str | None = Query(None, max_length=255),
+    created_after: str | None = Query(None),
+    created_before: str | None = Query(None),
+    updated_after: str | None = Query(None),
+    updated_before: str | None = Query(None),
+    sort_by: Literal["created", "updated"] = "created",
+    sort_order: Literal["asc", "desc"] = "desc",
+) -> IssueFilters:
+    return IssueFilters(
+        status=_clean(status),
+        search=_clean(search),
+        assignee=_clean(assignee),
+        issue_type=_clean(issue_type),
+        priority=_clean(priority),
+        created_after=_date("created_after", created_after),
+        created_before=_date("created_before", created_before),
+        updated_after=_date("updated_after", updated_after),
+        updated_before=_date("updated_before", updated_before),
+        sort_by=sort_by,
+        sort_order=sort_order,
+    )
+
+
+@router.get("/health", response_model=HealthResponse, summary="Liveness probe")
+async def health(request: Request) -> HealthResponse:
+    s = request.app.state.settings
+    return HealthResponse(status="ok", version=s.version, environment=s.app_env)
+
+
+@router.get("/ready", response_model=ReadinessResponse, summary="Readiness: tests the Jira connection")
+async def ready(refresh: bool = False, service: JiraService = Depends(get_service)):
+    result = await service.check_connection(force=refresh)
+    return JSONResponse(
+        status_code=200 if result.status == "ready" else 503, content=result.model_dump(mode="json")
+    )
+
+
+@router.get("/projects", response_model=ProjectsResponse)
+async def projects(refresh: bool = False, service: JiraService = Depends(get_service)):
+    return await service.list_projects(force=refresh)
+
+
+@router.get("/dashboard", response_model=DashboardResponse)
+async def dashboard(refresh: bool = False, service: JiraService = Depends(get_service)):
+    return await service.dashboard(force=refresh)
+
+
+@router.get("/projects/{project_key}/summary", response_model=ProjectSummary)
+async def project_summary(
+    project_key: str, refresh: bool = False, service: JiraService = Depends(get_service)
+):
+    return await service.project_summary(project_key, force=refresh)
+
+
+@router.get("/projects/{project_key}/statuses", response_model=StatusesResponse)
+async def project_statuses(
+    project_key: str, refresh: bool = False, service: JiraService = Depends(get_service)
+):
+    return await service.project_statuses(project_key, force=refresh)
+
+
+@router.get("/projects/{project_key}/issues", response_model=IssuePage)
+async def project_issues(
+    request: Request,
+    project_key: str,
+    filters: IssueFilters = Depends(get_filters),
+    page: int = Query(1, ge=1, le=100000),
+    page_size: int | None = Query(None, ge=1),
+    refresh: bool = False,
+    service: JiraService = Depends(get_service),
+):
+    settings = request.app.state.settings
+    size = page_size or settings.default_page_size
+    if size > settings.max_page_size:
+        raise InvalidParameter(f"page_size must be at most {settings.max_page_size}.")
+    return await service.list_issues(project_key, filters, page, size, force=refresh)
+
+
+@router.get("/projects/{project_key}/issues/{issue_key}", response_model=Issue)
+async def project_issue(
+    project_key: str, issue_key: str, service: JiraService = Depends(get_service)
+):
+    return await service.get_issue(project_key, issue_key)
+
+
+@router.get("/projects/{project_key}/export", summary="Export filtered issues as CSV")
+async def export_issues(
+    project_key: str,
+    filters: IssueFilters = Depends(get_filters),
+    service: JiraService = Depends(get_service),
+):
+    content, count = await service.export_csv(project_key, filters)
+    key = await service.require_project(project_key)
+    return Response(
+        content="\ufeff" + content,  # BOM so Excel opens UTF-8 correctly
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{key}-issues.csv"',
+            "X-Row-Count": str(count),
+        },
+    )
+
+
+========== app/integrations/jira_client.py ==========
+
+"""Read-only Jira Cloud REST API v3 client.
+
+Only GET requests are ever issued. Credentials live in the httpx client's auth
+object and are never logged or returned.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from collections.abc import AsyncIterator
+from typing import Any
+
+import httpx
+
+from app.core.config import Settings
+from app.core.errors import (
+    AppError,
+    JiraAuthError,
+    JiraBadRequest,
+    JiraForbidden,
+    JiraNotConfigured,
+    JiraNotFound,
+    JiraRateLimited,
+    JiraUnavailable,
+)
+
+logger = logging.getLogger(__name__)
+
+RETRY_STATUSES = {429, 502, 503, 504}
+MAX_RETRY_DELAY = 30.0
+
+
+class JiraClient:
+    def __init__(self, settings: Settings, http: httpx.AsyncClient | None = None):
+        self.settings = settings
+        self._http = http
+        if self._http is None and not settings.config_problems():
+            self._http = httpx.AsyncClient(
+                base_url=settings.jira_base_url,
+                auth=httpx.BasicAuth(settings.jira_email, settings.jira_api_token),
+                headers={"Accept": "application/json"},
+                timeout=httpx.Timeout(settings.jira_timeout_seconds, connect=10.0),
+                follow_redirects=False,
+            )
+
+    async def aclose(self) -> None:
+        if self._http is not None:
+            await self._http.aclose()
+
+    # ------------------------------------------------------------------ core
+    def _require_http(self) -> httpx.AsyncClient:
+        if self._http is None:
+            problems = self.settings.config_problems()
+            raise JiraNotConfigured(
+                "Jira credentials are missing or invalid in the backend configuration: "
+                + "; ".join(problems or ["unknown problem"])
+                + ".",
+                hint="Edit backend/.env (see backend/.env.example), then restart the backend.",
+            )
+        return self._http
+
+    async def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        http = self._require_http()
+        retries = self.settings.jira_max_retries
+        for attempt in range(retries + 1):
+            last = attempt >= retries
+            try:
+                response = await http.get(path, params=params)
+            except httpx.TimeoutException as exc:
+                if last:
+                    raise JiraUnavailable(
+                        "Jira did not respond in time.",
+                        hint="Try again, or increase JIRA_TIMEOUT_SECONDS.",
+                    ) from exc
+                await self._sleep(attempt, None)
+                continue
+            except httpx.TransportError as exc:
+                if last:
+                    raise JiraUnavailable(
+                        f"Could not reach Jira at {self.settings.jira_host}.",
+                        hint="Check JIRA_BASE_URL and your network connection.",
+                    ) from exc
+                await self._sleep(attempt, None)
+                continue
+            if response.status_code in RETRY_STATUSES and not last:
+                await self._sleep(attempt, response.headers.get("Retry-After"))
+                continue
+            return self._handle(response)
+        raise JiraUnavailable("Jira request failed.")  # pragma: no cover
+
+    async def _sleep(self, attempt: int, retry_after: str | None) -> None:
+        delay = self.settings.jira_retry_backoff_seconds * (2**attempt)
+        if retry_after:
+            try:
+                delay = max(delay, float(retry_after))
+            except ValueError:
+                pass
+        delay = min(delay, MAX_RETRY_DELAY)
+        logger.warning("Jira request will be retried", extra={"ctx": {"delay_seconds": delay}})
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+    @staticmethod
+    def _jira_messages(response: httpx.Response) -> str:
+        try:
+            body = response.json()
+        except ValueError:
+            return ""
+        parts = list(body.get("errorMessages") or []) + list((body.get("errors") or {}).values())
+        return "; ".join(str(p) for p in parts)[:300]
+
+    def _handle(self, response: httpx.Response) -> Any:
+        status = response.status_code
+        if 200 <= status < 300:
+            try:
+                return response.json()
+            except ValueError as exc:
+                raise JiraUnavailable(
+                    "Jira returned a response that is not JSON.",
+                    hint="Check that JIRA_BASE_URL points at your Jira Cloud site.",
+                ) from exc
+        detail = self._jira_messages(response)
+        if status == 401:
+            raise JiraAuthError(
+                "Jira rejected the email or API token.",
+                hint="Check JIRA_EMAIL and JIRA_API_TOKEN in backend/.env. Create a token at "
+                "https://id.atlassian.com/manage-profile/security/api-tokens and restart the backend.",
+            )
+        if status == 403:
+            raise JiraForbidden(
+                "Your Jira account is not allowed to read this data.",
+                hint="Ask a Jira admin to give this account Browse Projects permission on the "
+                "configured projects.",
+            )
+        if status == 404:
+            raise JiraNotFound(
+                "Jira could not find the requested project or issue.",
+               hint="Check that the project key is correct and your Jira account has Browse Projects permission.",
+            )
+        if status == 400:
+            raise JiraBadRequest(f"Jira rejected the query. {detail}".strip())
+        if status == 429:
+            raise JiraRateLimited(
+                "Jira is rate limiting requests.", hint="Wait a minute and refresh."
+            )
+        if status >= 500:
+            raise JiraUnavailable(f"Jira is temporarily unavailable (HTTP {status}).")
+        raise JiraUnavailable(f"Unexpected response from Jira (HTTP {status}).")
+
+    # -------------------------------------------------------------- endpoints
+    async def myself(self) -> dict[str, Any]:
+        return await self._get("/rest/api/3/myself")
+
+    async def get_project(self, key: str) -> dict[str, Any]:
+        return await self._get(f"/rest/api/3/project/{key}")
+
+    # NEW METHOD: List all accessible Jira projects
+    async def list_projects(self, page_size: int = 50) -> list[dict[str, Any]]:
+        """
+        Retrieve all Jira projects accessible to the authenticated account.
+
+        Uses Jira REST API v3 project search with pagination.
+        """
+        projects: list[dict[str, Any]] = []
+        seen_keys: set[str] = set()
+        start_at = 0
+
+        while True:
+            data = await self._get(
+                "/rest/api/3/project/search",
+                params={
+                    "startAt": start_at,
+                    "maxResults": page_size,
+                    "orderBy": "key",
+                },
+            )
+
+            batch = data.get("values", [])
+
+            for project in batch:
+                key = project.get("key")
+
+                if key and key not in seen_keys:
+                    seen_keys.add(key)
+                    projects.append(project)
+
+            # Jira confirms that this is the final page.
+            if data.get("isLast") is True:
+                break
+
+            # Stop if Jira returns no additional projects.
+            if not batch:
+                break
+
+            start_at += len(batch)
+
+            total = data.get("total")
+            if total is not None and start_at >= total:
+                break
+
+        return projects
+
+    async def get_project_statuses(self, key: str) -> list[dict[str, Any]]:
+        return await self._get(f"/rest/api/3/project/{key}/statuses")
+
+    async def get_issue(self, issue_key: str, fields: str) -> dict[str, Any]:
+        return await self._get(f"/rest/api/3/issue/{issue_key}", {"fields": fields})
+
+    async def search_page(
+        self, jql: str, fields: str, max_results: int, next_page_token: str | None = None
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"jql": jql, "fields": fields, "maxResults": max_results}
+        if next_page_token:
+            params["nextPageToken"] = next_page_token
+        return await self._get("/rest/api/3/search/jql", params)
+
+    async def iter_search(
+        self, jql: str, fields: str, page_size: int
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Yield every issue matching ``jql`` following nextPageToken.
+
+        Issues are de-duplicated by key and a repeated token aborts loudly so
+        results are never silently truncated.
+        """
+        seen_keys: set[str] = set()
+        seen_tokens: set[str] = set()
+        token: str | None = None
+        while True:
+            data = await self.search_page(jql, fields, page_size, token)
+            for issue in data.get("issues", []):
+                ident = issue.get("key") or issue.get("id")
+                if ident is None or ident in seen_keys:
+                    continue
+                seen_keys.add(ident)
+                yield issue
+            token = data.get("nextPageToken")
+            if not token or data.get("isLast") is True:
+                return
+            if token in seen_tokens:
+                raise AppError("Jira returned a repeating pagination token; results incomplete.")
+            seen_tokens.add(token)
+
+    async def search_all(self, jql: str, fields: str, page_size: int) -> list[dict[str, Any]]:
+        return [issue async for issue in self.iter_search(jql, fields, page_size)]
+
+
+========== app/services/jira_service.py ==========
+
+
+"""Business logic on top of the Jira client: discovery, aggregation, issue lists."""
+
+
+
+from __future__ import annotations
+
+
+
+import asyncio
+
+import csv
+
+import io
+
+import logging
+
+from collections import Counter
+
+from datetime import datetime, timezone
+
+from typing import Any
+
+
+
+from app.core.cache import TTLCache
+
+from app.core.config import PROJECT_KEY_RE, Settings
+
+from app.integrations.jira_client import JiraClient
+
+from app.schemas.models import (
+
+    AssigneeFacet,
+
+    CacheMeta,
+
+    DashboardProject,
+
+    DashboardResponse,
+
+    ErrorBody,
+
+    FacetCount,
+
+    Issue,
+
+    IssuePage,
+
+    JiraConnection,
+
+    Pagination,
+
+    ProjectInfo,
+
+    ProjectsResponse,
+
+    ProjectSummary,
+
+    ReadinessResponse,
+
+    StatusCount,
+
+    StatusesResponse,
+
+)
+
+from app.services.jql import ISSUE_KEY_RE, IssueFilters, build_jql
+
+from app.services.normalizer import normalize_issue
+
+
+
+from app.core.errors import (
+
+    AppError,
+
+    InvalidParameter,
+
+    JiraNotConfigured,
+
+    ProjectNotConfigured,
+
+)
+
+
+
+logger = logging.getLogger(__name__)
+
+
+
+STATS_FIELDS = "status,assignee,issuetype,priority"
+
+
+
+
+ISSUE_FIELDS = (
+    "summary,description,status,assignee,reporter,issuetype,"
+    "priority,created,updated"
+)
+
+
+
+
+CATEGORY_ORDER = {
+
+    "new": 0,
+
+    "indeterminate": 1,
+
+    "done": 2,
+
+}
+
+
+
+CSV_HEADERS = [
+
+    "Ticket ID",
+
+    "Summary",
+
+    "Status",
+
+    "Assignee",
+
+    "Reporter",
+
+    "Issue Type",
+
+    "Priority",
+
+    "Created Date",
+
+    "Updated Date",
+
+    "URL",
+
+]
+
+
+
+# Maximum number of project summaries loaded simultaneously.
+
+MAX_CONCURRENT_PROJECTS = 5
+
+
+
+
+
+def error_body(exc: AppError) -> ErrorBody:
+
+    return ErrorBody(
+
+        code=exc.code,
+
+        message=exc.message,
+
+        hint=exc.hint,
+
+    )
+
+
+
+
+
+def _csv_safe(value: Any) -> str:
+
+    """Neutralise spreadsheet formula injection."""
+
+    text = "" if value is None else str(value)
+
+
+
+    return (
+
+        "'" + text
+
+        if text[:1] in ("=", "+", "-", "@", "\t", "\r")
+
+        else text
+
+    )
+
+
+
+
+
+class JiraService:
+
+
+
+    def __init__(
+
+        self,
+
+        settings: Settings,
+
+        client: JiraClient,
+
+        cache: TTLCache | None = None,
+
+    ):
+
+        self.settings = settings
+
+        self.client = client
+
+        self.cache = cache or TTLCache(settings.cache_ttl_seconds)
+
+
+
+    # ------------------------------------------------------------
+
+    # Helpers
+
+    # ------------------------------------------------------------
+
+
+
+    async def require_project(self, key: str) -> str:
+        """
+        Validate project key syntax and confirm that the project is
+        accessible to the currently connected Jira account.
+        """
+
+        normalized = key.strip().upper()
+
+        if not PROJECT_KEY_RE.match(normalized):
+            raise InvalidParameter(
+                f"'{key}' is not a valid Jira project key."
+            )
+
+        self._ensure_configured()
+
+        # Project discovery is cached and shared by the projects/dashboard APIs.
+        discovery = await self._discover_projects()
+
+        available_keys = {
+            str(project.get("key", "")).strip().upper()
+            for project in discovery.value
+            if project.get("key")
+        }
+
+        if normalized not in available_keys:
+            raise ProjectNotConfigured(
+                f"Project '{normalized}' is not available "
+                "to the connected Jira account.",
+                hint=(
+                    "Check whether the project exists and whether "
+                    "the connected Jira account has permission to access it."
+                ),
+            )
+
+        return normalized
+
+
+    def _meta(
+
+        self,
+
+        fetched_at: datetime,
+
+        hit: bool,
+
+    ) -> CacheMeta:
+
+        return CacheMeta(
+
+            fetched_at=fetched_at,
+
+            cached=hit,
+
+            ttl_seconds=self.settings.cache_ttl_seconds,
+
+        )
+
+
+
+    def _project_url(self, key: str) -> str:
+
+        return f"{self.settings.jira_base_url}/browse/{key}"
+
+
+
+    def _ensure_configured(self) -> None:
+
+        problems = self.settings.config_problems()
+
+
+
+        if problems:
+
+            raise JiraNotConfigured(
+
+                "Jira credentials are missing or invalid in the "
+
+                "backend configuration: "
+
+                + "; ".join(problems)
+
+                + ".",
+
+                hint=(
+
+                    "Edit backend/.env "
+
+                    "(see backend/.env.example), "
+
+                    "then restart the backend."
+
+                ),
+
+            )
+
+
+
+    # ------------------------------------------------------------
+
+    # Jira connection readiness
+
+    # ------------------------------------------------------------
+
+
+
+    async def check_connection(
+
+        self,
+
+        force: bool = False,
+
+    ) -> ReadinessResponse:
+
+
+
+        now = datetime.now(timezone.utc)
+
+
+
+        try:
+
+            self._ensure_configured()
+
+
+
+            res = await self.cache.get_or_load(
+
+                "myself",
+
+                self.client.myself,
+
+                force=force,
+
+                ttl=min(
+
+                    30,
+
+                    self.settings.cache_ttl_seconds,
+
+                ),
+
+            )
+
+
+
+            me = res.value
+
+
+
+            conn = JiraConnection(
+
+                connected=True,
+
+                site=self.settings.jira_host,
+
+                account=me.get("displayName"),
+
+                checked_at=res.fetched_at,
+
+            )
+
+
+
+            return ReadinessResponse(
+
+                status="ready",
+
+                jira=conn,
+
+            )
+
+
+
+        except AppError as exc:
+
+
+
+            conn = JiraConnection(
+
+                connected=False,
+
+                site=self.settings.jira_host or None,
+
+                checked_at=now,
+
+                error=error_body(exc),
+
+            )
+
+
+
+            return ReadinessResponse(
+
+                status="not_ready",
+
+                jira=conn,
+
+            )
+
+
+
+    # ------------------------------------------------------------
+
+    # Project discovery
+
+    # ------------------------------------------------------------
+
+
+
+    async def _project_meta(
+
+        self,
+
+        key: str,
+
+        force: bool = False,
+
+    ):
+
+
+
+        return await self.cache.get_or_load(
+
+            f"project:{key}",
+
+            lambda: self.client.get_project(key),
+
+            force=force,
+
+            ttl=(
+
+                self.settings.project_meta_ttl_seconds
+
+                if self.settings.cache_ttl_seconds
+
+                else 0
+
+            ),
+
+        )
+
+
+
+    async def _discover_projects(
+
+        self,
+
+        force: bool = False,
+
+    ):
+
+        """
+
+        Discover all Jira projects accessible to the current account.
+
+
+
+        Uses JiraClient.list_projects(), which handles pagination.
+
+        Results are cached to avoid unnecessary Jira requests.
+
+        """
+
+
+
+        return await self.cache.get_or_load(
+
+            "projects:all",
+
+            self.client.list_projects,
+
+            force=force,
+
+            ttl=(
+
+                self.settings.project_meta_ttl_seconds
+
+                if self.settings.cache_ttl_seconds
+
+                else 0
+
+            ),
+
+        )
+
+
+
+    async def list_projects(
+
+        self,
+
+        force: bool = False,
+
+    ) -> ProjectsResponse:
+
+
+
+        self._ensure_configured()
+
+
+
+        result = await self._discover_projects(force=force)
+
+
+
+        projects: list[ProjectInfo] = []
+
+
+
+        for project in result.value:
+
+
+
+            key = project.get("key")
+
+
+
+            if not key:
+
+                continue
+
+
+
+            key = str(key).upper()
+
+
+
+            if not PROJECT_KEY_RE.match(key):
+
+                logger.warning(
+
+                    "Ignoring Jira project with invalid key format"
+
+                )
+
+                continue
+
+
+
+            projects.append(
+
+                ProjectInfo(
+
+                    key=key,
+
+                    name=project.get("name"),
+
+                    url=self._project_url(key),
+
+                    ok=True,
+
+                )
+
+            )
+
+
+
+        projects.sort(
+
+            key=lambda project: project.key.upper()
+
+        )
+
+
+
+        return ProjectsResponse(
+
+            jira_site=self.settings.jira_host,
+
+            projects=projects,
+
+        )
+
+
+
+    # ------------------------------------------------------------
+
+    # Project statistics
+
+    # ------------------------------------------------------------
+
+
+
+    async def _load_stats(
+
+        self,
+
+        key: str,
+
+        force: bool,
+
+    ) -> dict[str, Any]:
+
+
+
+        meta_res, statuses_raw = await asyncio.gather(
+
+            self._project_meta(key, force),
+
+            self.client.get_project_statuses(key),
+
+        )
+
+
+
+        meta = meta_res.value
+
+
+
+        statuses: dict[str, dict[str, Any]] = {}
+
+
+
+        # Include statuses configured for the project.
+
+        for issue_type in statuses_raw:
+
+
+
+            for st in issue_type.get("statuses", []):
+
+
+
+                cat = st.get("statusCategory") or {}
+
+
+
+                statuses.setdefault(
+
+                    str(st["id"]),
+
+                    {
+
+                        "id": str(st["id"]),
+
+                        "name": st["name"],
+
+                        "category": cat.get("key"),
+
+                        "category_name": cat.get("name"),
+
+                        "count": 0,
+
+                    },
+
+                )
+
+
+
+        issue_types: Counter[
+
+            tuple[str | None, str]
+
+        ] = Counter()
+
+
+
+        priorities: Counter[
+
+            tuple[str | None, str]
+
+        ] = Counter()
+
+
+
+        assignees: Counter[
+
+            tuple[str, str]
+
+        ] = Counter()
+
+
+
+        unassigned = 0
+
+        total = 0
+
+
+
+        # Retrieve every issue using Jira pagination.
+
+        async for issue in self.client.iter_search(
+
+            f'project = "{key}"',
+
+            STATS_FIELDS,
+
+            self.settings.stats_page_size,
+
+        ):
+
+
+
+            total += 1
+
+
+
+            fields = issue.get("fields") or {}
+
+
+
+            # Status statistics.
+
+            st = fields.get("status") or {}
+
+
+
+            if st.get("name"):
+
+
+
+                sid = str(
+
+                    st.get("id") or st["name"]
+
+                )
+
+
+
+                cat = st.get("statusCategory") or {}
+
+
+
+                entry = statuses.setdefault(
+
+                    sid,
+
+                    {
+
+                        "id": sid,
+
+                        "name": st["name"],
+
+                        "category": cat.get("key"),
+
+                        "category_name": cat.get("name"),
+
+                        "count": 0,
+
+                    },
+
+                )
+
+
+
+                entry["count"] += 1
+
+
+
+            # Issue type statistics.
+
+            it = fields.get("issuetype") or {}
+
+
+
+            if it.get("name"):
+
+
+
+                issue_types[
+
+                    (
+
+                        str(it.get("id"))
+
+                        if it.get("id")
+
+                        else None,
+
+                        it["name"],
+
+                    )
+
+                ] += 1
+
+
+
+            # Priority statistics.
+
+            pr = fields.get("priority") or {}
+
+
+
+            if pr.get("name"):
+
+
+
+                priorities[
+
+                    (
+
+                        str(pr.get("id"))
+
+                        if pr.get("id")
+
+                        else None,
+
+                        pr["name"],
+
+                    )
+
+                ] += 1
+
+
+
+            # Assignee statistics.
+
+            asg = fields.get("assignee") or {}
+
+
+
+            if asg.get("accountId"):
+
+
+
+                assignees[
+
+                    (
+
+                        asg["accountId"],
+
+                        asg.get("displayName")
+
+                        or asg["accountId"],
+
+                    )
+
+                ] += 1
+
+
+
+            else:
+
+                unassigned += 1
+
+
+
+        # Include project issue types even when unused.
+
+        for it in meta.get("issueTypes", []):
+
+
+
+            ident = (
+
+                str(it["id"])
+
+                if it.get("id")
+
+                else None
+
+            )
+
+
+
+            if not any(
+
+                name == it["name"]
+
+                for _, name in issue_types
+
+            ):
+
+
+
+                issue_types[
+
+                    (ident, it["name"])
+
+                ] += 0
+
+
+
+        ordered_statuses = sorted(
+
+            statuses.values(),
+
+            key=lambda status: CATEGORY_ORDER.get(
+
+                status["category"],
+
+                3,
+
+            ),
+
+        )
+
+
+
+        return {
+
+            "name": meta.get("name") or key,
+
+            "total": total,
+
+            "statuses": ordered_statuses,
+
+            "issue_types": sorted(
+
+                issue_types.items(),
+
+                key=lambda item: item[0][1].lower(),
+
+            ),
+
+            "priorities": sorted(
+
+                priorities.items(),
+
+                key=lambda item: -item[1],
+
+            ),
+
+            "assignees": sorted(
+
+                assignees.items(),
+
+                key=lambda item: item[0][1].lower(),
+
+            ),
+
+            "unassigned": unassigned,
+
+        }
+
+
+
+    # ------------------------------------------------------------
+
+    # Project summary
+
+    # ------------------------------------------------------------
+
+
+
+    async def project_summary(
+
+        self,
+
+        key: str,
+
+        force: bool = False,
+
+    ) -> ProjectSummary:
+
+
+
+        key = await self.require_project(key)
+
+
+
+        self._ensure_configured()
+
+
+
+        res = await self.cache.get_or_load(
+
+            f"stats:{key}",
+
+            lambda: self._load_stats(key, force),
+
+            force=force,
+
+        )
+
+
+
+        data = res.value
+
+
+
+        return ProjectSummary(
+
+            key=key,
+
+            name=data["name"],
+
+            url=self._project_url(key),
+
+            total=data["total"],
+
+            statuses=[
+
+                StatusCount(**status)
+
+                for status in data["statuses"]
+
+            ],
+
+            issue_types=[
+
+                FacetCount(
+
+                    id=ident,
+
+                    name=name,
+
+                    count=count,
+
+                )
+
+                for (ident, name), count
+
+                in data["issue_types"]
+
+            ],
+
+            priorities=[
+
+                FacetCount(
+
+                    id=ident,
+
+                    name=name,
+
+                    count=count,
+
+                )
+
+                for (ident, name), count
+
+                in data["priorities"]
+
+            ],
+
+            assignees=[
+
+                AssigneeFacet(
+
+                    account_id=account_id,
+
+                    display_name=display_name,
+
+                    count=count,
+
+                )
+
+                for (account_id, display_name), count
+
+                in data["assignees"]
+
+            ],
+
+            unassigned=data["unassigned"],
+
+            meta=self._meta(
+
+                res.fetched_at,
+
+                res.hit,
+
+            ),
+
+        )
+
+
+
+    # ------------------------------------------------------------
+
+    # Project statuses
+
+    # ------------------------------------------------------------
+
+
+
+    async def project_statuses(
+
+        self,
+
+        key: str,
+
+        force: bool = False,
+
+    ) -> StatusesResponse:
+
+
+
+        summary = await self.project_summary(
+
+            key,
+
+            force,
+
+        )
+
+
+
+        return StatusesResponse(
+
+            project_key=summary.key,
+
+            statuses=summary.statuses,
+
+            meta=summary.meta,
+
+        )
+
+
+
+    # ------------------------------------------------------------
+
+    # Dynamic dashboard
+
+    # ------------------------------------------------------------
+
+
+
+    async def dashboard(
+
+        self,
+
+        force: bool = False,
+
+    ) -> DashboardResponse:
+
+
+
+        self._ensure_configured()
+
+
+
+        # Discover projects directly from Jira.
+
+        discovery = await self._discover_projects(
+
+            force=force
+
+        )
+
+
+
+        project_keys: list[str] = []
+
+
+
+        for project in discovery.value:
+
+
+
+            key = project.get("key")
+
+
+
+            if not key:
+
+                continue
+
+
+
+            key = str(key).upper()
+
+
+
+            if PROJECT_KEY_RE.match(key):
+
+                project_keys.append(key)
+
+
+
+        project_keys = sorted(set(project_keys))
+
+
+
+        semaphore = asyncio.Semaphore(
+
+            MAX_CONCURRENT_PROJECTS
+
+        )
+
+
+
+        async def one(key: str) -> DashboardProject:
+
+
+
+            async with semaphore:
+
+
+
+                try:
+
+
+
+                    summary = await self.project_summary(
+
+                        key,
+
+                        force=force,
+
+                    )
+
+
+
+                    return DashboardProject(
+
+                        key=key,
+
+                        url=self._project_url(key),
+
+                        ok=True,
+
+                        summary=summary,
+
+                    )
+
+
+
+                except AppError as exc:
+
+
+
+                    logger.warning(
+
+                        "Project load failed",
+
+                        extra={
+
+                            "ctx": {
+
+                                "project": key,
+
+                                "code": exc.code,
+
+                            }
+
+                        },
+
+                    )
+
+
+
+                    return DashboardProject(
+
+                        key=key,
+
+                        url=self._project_url(key),
+
+                        ok=False,
+
+                        error=error_body(exc),
+
+                    )
+
+
+
+        # Load discovered projects with controlled concurrency.
+
+        projects = await asyncio.gather(
+
+            *(one(key) for key in project_keys)
+
+        )
+
+
+
+        successful = [
+
+            project.summary.meta
+
+            for project in projects
+
+            if project.summary
+
+        ]
+
+
+
+        return DashboardResponse(
+
+            jira_site=self.settings.jira_host,
+
+            projects=list(projects),
+
+            synced_at=min(
+
+                (
+
+                    meta.fetched_at
+
+                    for meta in successful
+
+                ),
+
+                default=None,
+
+            ),
+
+            cached=(
+
+                bool(successful)
+
+                and all(
+
+                    meta.cached
+
+                    for meta in successful
+
+                )
+
+            ),
+
+        )
+
+
+
+    # ------------------------------------------------------------
+
+    # Issue retrieval helpers
+
+    # ------------------------------------------------------------
+
+
+
+    async def _issue_keys(
+
+        self,
+
+        jql: str,
+
+        force: bool,
+
+    ):
+
+
+
+        async def load() -> list[str]:
+
+
+
+            issues = await self.client.search_all(
+
+                jql,
+
+                "key",
+
+                self.settings.key_page_size,
+
+            )
+
+
+
+            return [
+
+                issue["key"]
+
+                for issue in issues
+
+                if ISSUE_KEY_RE.match(
+
+                    issue.get("key", "")
+
+                )
+
+            ]
+
+
+
+        return await self.cache.get_or_load(
+
+            f"keys:{jql}",
+
+            load,
+
+            force=force,
+
+        )
+
+
+
+    # ------------------------------------------------------------
+
+    # Project issue listing
+
+    # ------------------------------------------------------------
+
+
+
+    async def list_issues(
+
+        self,
+
+        key: str,
+
+        filters: IssueFilters,
+
+        page: int,
+
+        page_size: int,
+
+        force: bool = False,
+
+    ) -> IssuePage:
+
+
+
+        key = await self.require_project(key)
+
+
+
+        self._ensure_configured()
+
+
+
+        jql = build_jql(key, filters)
+
+
+
+        offset = (page - 1) * page_size
+
+
+
+        async def load() -> tuple[list[Issue], int]:
+
+
+
+            keys = (
+
+                await self._issue_keys(
+
+                    jql,
+
+                    force,
+
+                )
+
+            ).value
+
+
+
+            window = keys[
+
+                offset:offset + page_size
+
+            ]
+
+
+
+            if not window:
+
+                return [], len(keys)
+
+
+
+            detail_jql = (
+
+                f"key in ({', '.join(window)})"
+
+            )
+
+
+
+            raws = await self.client.search_all(
+
+                detail_jql,
+
+                ISSUE_FIELDS,
+
+                self.settings.detail_page_size,
+
+            )
+
+
+
+            by_key = {
+
+                raw["key"]: raw
+
+                for raw in raws
+
+            }
+
+
+
+            items = [
+
+                normalize_issue(
+
+                    by_key[issue_key],
+
+                    self.settings.jira_base_url,
+
+                )
+
+                for issue_key in window
+
+                if issue_key in by_key
+
+            ]
+
+
+
+            return items, len(keys)
+
+
+
+        res = await self.cache.get_or_load(
+
+            f"issues:{jql}:{offset}:{page_size}",
+
+            load,
+
+            force=force,
+
+        )
+
+
+
+        items, total = res.value
+
+
+
+        total_pages = max(
+
+            1,
+
+            -(-total // page_size),
+
+        )
+
+
+
+        return IssuePage(
+
+            items=items,
+
+            pagination=Pagination(
+
+                page=page,
+
+                page_size=page_size,
+
+                total=total,
+
+                total_pages=total_pages,
+
+                has_next=page < total_pages,
+
+                has_prev=page > 1,
+
+            ),
+
+            jql=jql,
+
+            meta=self._meta(
+
+                res.fetched_at,
+
+                res.hit,
+
+            ),
+
+        )
+
+
+
+    # ------------------------------------------------------------
+
+    # Individual issue retrieval
+
+    # ------------------------------------------------------------
+
+
+
+    async def get_issue(
+
+        self,
+
+        project_key: str,
+
+        issue_key: str,
+
+    ) -> Issue:
+
+
+
+        project_key = await self.require_project(project_key)
+
+
+
+        self._ensure_configured()
+
+
+
+        issue_key = issue_key.strip().upper()
+
+
+
+        if (
+
+            not ISSUE_KEY_RE.match(issue_key)
+
+            or not issue_key.startswith(
+
+                project_key + "-"
+
+            )
+
+        ):
+
+            raise InvalidParameter(
+
+                f"'{issue_key}' is not a valid "
+
+                f"{project_key} ticket key."
+
+            )
+
+
+
+        raw = await self.client.get_issue(
+
+            issue_key,
+
+            ISSUE_FIELDS,
+
+        )
+
+
+
+        return normalize_issue(
+
+            raw,
+
+            self.settings.jira_base_url,
+
+        )
+
+
+
+    # ------------------------------------------------------------
+
+    # CSV export
+
+    # ------------------------------------------------------------
+
+
+
+    async def export_csv(
+
+        self,
+
+        key: str,
+
+        filters: IssueFilters,
+
+    ) -> tuple[str, int]:
+
+
+
+        key = await self.require_project(key)
+
+
+
+        self._ensure_configured()
+
+
+
+        jql = build_jql(key, filters)
+
+
+
+        raws = await self.client.search_all(
+
+            jql,
+
+            ISSUE_FIELDS,
+
+            self.settings.detail_page_size,
+
+        )
+
+
+
+        buffer = io.StringIO()
+
+
+
+        writer = csv.writer(buffer)
+
+
+
+        writer.writerow(CSV_HEADERS)
+
+
+
+        for raw in raws:
+
+
+
+            issue = normalize_issue(
+
+                raw,
+
+                self.settings.jira_base_url,
+
+            )
+
+
+
+            writer.writerow(
+
+                [
+
+                    _csv_safe(value)
+
+                    for value in (
+
+                        issue.key,
+
+                        issue.summary,
+
+                        (
+
+                            issue.status.name
+
+                            if issue.status
+
+                            else None
+
+                        ),
+
+                        (
+
+                            issue.assignee.display_name
+
+                            if issue.assignee
+
+                            else "Unassigned"
+
+                        ),
+
+                        (
+
+                            issue.reporter.display_name
+
+                            if issue.reporter
+
+                            else None
+
+                        ),
+
+                        (
+
+                            issue.issue_type.name
+
+                            if issue.issue_type
+
+                            else None
+
+                        ),
+
+                        (
+
+                            issue.priority.name
+
+                            if issue.priority
+
+                            else None
+
+                        ),
+
+                        (
+
+                            issue.created.isoformat()
+
+                            if issue.created
+
+                            else None
+
+                        ),
+
+                        (
+
+                            issue.updated.isoformat()
+
+                            if issue.updated
+
+                            else None
+
+                        ),
+
+                        issue.url,
+
+                    )
+
+                ]
+
+            )
+
+
+
+        return buffer.getvalue(), len(raws)
+
+
+========== app/services/ticket_classifier.py ==========
+
+"""Classify Jira tickets into Manual and Automation categories."""
+from __future__ import annotations
+
+import re
+from enum import StrEnum
+
+
+class TicketCategory(StrEnum):
+    MANUAL = "manual"
+    AUTOMATION = "automation"
+
+
+# Match "automation" as a complete word, case-insensitively.
+# This includes descriptions such as "Automation Bug" and
+# "Automation testing" without matching unrelated substrings.
+_AUTOMATION_PATTERN = re.compile(r"\bautomation\b", re.IGNORECASE)
+
+
+def classify_ticket(description: str | None) -> TicketCategory:
+    """
+    Classify a ticket using its extracted description text.
+
+    Rules:
+    - Contains the word "Automation" -> Automation
+    - Missing or empty description -> Manual
+    - Otherwise -> Manual
+    """
+    if not description:
+        return TicketCategory.MANUAL
+
+    if _AUTOMATION_PATTERN.search(description):
+        return TicketCategory.AUTOMATION
+
+    return TicketCategory.MANUAL
+
+
+========== app/services/normalizer.py ==========
+
+"""Convert raw Jira issue JSON into our schemas. Missing data stays None."""
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any
+
+from app.schemas.models import Issue, NamedRef, Person, StatusRef
+from app.services.description import extract_description_text
+
+
+def parse_jira_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z"):
+        try:
+            return datetime.strptime(value, fmt).astimezone(timezone.utc)
+        except ValueError:
+            continue
+
+    return None
+
+
+def _person(raw: Any) -> Person | None:
+    if not isinstance(raw, dict):
+        return None
+
+    name = raw.get("displayName") or raw.get("emailAddress")
+    if not name:
+        return None
+
+    return Person(
+        account_id=raw.get("accountId"),
+        display_name=str(name),
+    )
+
+
+def _named(raw: Any) -> NamedRef | None:
+    if not isinstance(raw, dict) or not raw.get("name"):
+        return None
+
+    return NamedRef(
+        id=str(raw["id"]) if raw.get("id") is not None else None,
+        name=raw["name"],
+    )
+
+
+def _status(raw: Any) -> StatusRef | None:
+    if not isinstance(raw, dict) or not raw.get("name"):
+        return None
+
+    category = raw.get("statusCategory") or {}
+
+    return StatusRef(
+        id=str(raw["id"]) if raw.get("id") is not None else None,
+        name=raw["name"],
+        category=category.get("key"),
+    )
+
+
+def normalize_issue(raw: dict[str, Any], base_url: str) -> Issue:
+    fields = raw.get("fields") or {}
+    key = raw["key"]
+
+    return Issue(
+        id=str(raw.get("id", key)),
+        key=key,
+        url=f"{base_url}/browse/{key}",
+        summary=fields.get("summary"),
+        description=extract_description_text(fields.get("description")),
+        status=_status(fields.get("status")),
+        assignee=_person(fields.get("assignee")),
+        reporter=_person(fields.get("reporter")),
+        issue_type=_named(fields.get("issuetype")),
+        priority=_named(fields.get("priority")),
+        created=parse_jira_datetime(fields.get("created")),
+        updated=parse_jira_datetime(fields.get("updated")),
+    )
+
+
+========== app/services/jql.py ==========
+"""Safe JQL construction. Every user supplied value is validated or quoted."""
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from datetime import date, timedelta
+from typing import Literal
+
+from app.core.errors import InvalidParameter
+
+UNASSIGNED = "__unassigned__"
+ISSUE_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]+-\d+$")
+ACCOUNT_ID_RE = re.compile(r"^[A-Za-z0-9:_\-]{1,128}$")
+_FULL_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]+-\d+$")
+_DIGITS_RE = re.compile(r"^\d+$")
+_NON_WORD = re.compile(r"[^\w\s]", re.UNICODE)
+MAX_VALUE_LENGTH = 255
+
+
+@dataclass(frozen=True)
+class IssueFilters:
+    status: str | None = None
+    search: str | None = None
+    assignee: str | None = None
+    issue_type: str | None = None
+    priority: str | None = None
+    created_after: date | None = None
+    created_before: date | None = None
+    updated_after: date | None = None
+    updated_before: date | None = None
+    sort_by: Literal["created", "updated"] = "created"
+    sort_order: Literal["asc", "desc"] = "desc"
+
+
+def quote(value: str) -> str:
+    """Return ``value`` as a safely quoted JQL string literal."""
+    if len(value) > MAX_VALUE_LENGTH:
+        raise InvalidParameter("A filter value is too long.")
+    if any(ord(ch) < 32 for ch in value):
+        raise InvalidParameter("Filter values must not contain control characters.")
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _search_clause(project_key: str, search: str) -> str:
+    text = search.strip()
+    parts: list[str] = []
+    if _FULL_KEY_RE.match(text):
+        parts.append(f"key = {quote(text.upper())}")
+    elif _DIGITS_RE.match(text):
+        parts.append(f"key = {quote(f'{project_key}-{text}')}")
+    tokens = [t for t in _NON_WORD.sub(" ", text).split() if t]
+    if tokens:
+        parts.append(" AND ".join(f"summary ~ {quote(t + '*')}" for t in tokens))
+        if len(parts) == 2:
+            parts[1] = f"({parts[1]})"
+    if not parts:
+        raise InvalidParameter("Search text must contain letters or numbers.")
+    return "(" + " OR ".join(parts) + ")" if len(parts) > 1 else parts[0]
+
+
+def build_jql(project_key: str, f: IssueFilters, *, order: bool = True) -> str:
+    clauses = [f"project = {quote(project_key)}"]
+    if f.status:
+        clauses.append(f"status = {quote(f.status)}")
+    if f.issue_type:
+        clauses.append(f"issuetype = {quote(f.issue_type)}")
+    if f.priority:
+        clauses.append(f"priority = {quote(f.priority)}")
+    if f.assignee:
+        if f.assignee == UNASSIGNED:
+            clauses.append("assignee is EMPTY")
+        elif ACCOUNT_ID_RE.match(f.assignee):
+            clauses.append(f"assignee = {quote(f.assignee)}")
+        else:
+            raise InvalidParameter("assignee must be a Jira account id.")
+    if f.search and f.search.strip():
+        clauses.append(_search_clause(project_key, f.search))
+    for field_name, after, before in (
+        ("created", f.created_after, f.created_before),
+        ("updated", f.updated_after, f.updated_before),
+    ):
+        if after:
+            clauses.append(f'{field_name} >= "{after.isoformat()}"')
+        if before:  # inclusive of the whole "before" day
+            clauses.append(f'{field_name} < "{(before + timedelta(days=1)).isoformat()}"')
+    jql = " AND ".join(clauses)
+    if order:
+        direction = "ASC" if f.sort_order == "asc" else "DESC"
+        jql += f" ORDER BY {f.sort_by} {direction}, key {direction}"
+    return jql
+
+def build_testing_dashboard_jql(
+    project_keys: list[str],
+    filters: IssueFilters,
+    category: Literal["manual", "automation"],
+) -> str:
+    """
+    Build a Jira query for Manual or Automation tickets
+    across the accessible projects.
+    """
+    if not project_keys:
+        raise InvalidParameter("No accessible Jira projects were found.")
+
+    if category not in ("manual", "automation"):
+        raise InvalidParameter("Category must be manual or automation.")
+
+    # Validate and quote project keys.
+    validated_keys = []
+    for key in project_keys:
+        normalized = key.strip().upper()
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]+", normalized):
+            raise InvalidParameter("An invalid Jira project key was found.")
+        validated_keys.append(quote(normalized))
+
+    clauses = [
+        f"project in ({', '.join(validated_keys)})"
+    ]
+
+    # Category classification is performed by Jira's description index.
+    if category == "automation":
+        clauses.append('description ~ "automation"')
+    else:
+        clauses.append(
+            '(description is EMPTY OR description !~ "automation")'
+        )
+
+    if filters.status:
+        clauses.append(f"status = {quote(filters.status)}")
+
+    if filters.issue_type:
+        clauses.append(f"issuetype = {quote(filters.issue_type)}")
+
+    if filters.priority:
+        clauses.append(f"priority = {quote(filters.priority)}")
+
+    if filters.assignee:
+        if filters.assignee == UNASSIGNED:
+            clauses.append("assignee is EMPTY")
+        elif ACCOUNT_ID_RE.fullmatch(filters.assignee):
+            clauses.append(f"assignee = {quote(filters.assignee)}")
+        else:
+            raise InvalidParameter("assignee must be a Jira account id.")
+
+    if filters.search and filters.search.strip():
+        # Existing search helper requires a project key for numeric searches.
+        # Use a shared summary/key search for cross-project queries.
+        text = filters.search.strip()
+        if len(text) > MAX_VALUE_LENGTH:
+            raise InvalidParameter("A filter value is too long.")
+
+        if any(ord(ch) < 32 for ch in text):
+            raise InvalidParameter("Filter values must not contain control characters.")
+
+        tokens = [
+            token
+            for token in _NON_WORD.sub(" ", text).split()
+            if token
+        ]
+        if not tokens:
+            raise InvalidParameter("Search text must contain letters or numbers.")
+
+        clauses.append(
+            "(" + " AND ".join(
+                f"summary ~ {quote(token + '*')}" for token in tokens
+            ) + ")"
+        )
+
+    for field_name, after, before in (
+        ("created", filters.created_after, filters.created_before),
+        ("updated", filters.updated_after, filters.updated_before),
+    ):
+        if after:
+            clauses.append(f'{field_name} >= "{after.isoformat()}"')
+        if before:
+            clauses.append(
+                f'{field_name} < "{(before + timedelta(days=1)).isoformat()}"'
+            )
+
+    direction = "ASC" if filters.sort_order == "asc" else "DESC"
+    clauses.append(
+        f"ORDER BY {filters.sort_by} {direction}, key {direction}"
+    )
+
+    return " AND ".join(clauses)
+
+
+========== app/models/ticket.py ==========
+
+"""Persistent Jira ticket index."""
+
+from __future__ import annotations
+
+from datetime import datetime
+
+from sqlalchemy import (
+    CheckConstraint,
+    DateTime,
+    Index,
+    String,
+    Text,
+    func,
+)
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.models.base import Base
+
+
+class Ticket(Base):
+    __tablename__ = "tickets"
+
+    __table_args__ = (
+        CheckConstraint(
+            "category IN ('manual', 'automation')",
+            name="ck_tickets_category",
+        ),
+        Index(
+            "ix_tickets_category_created",
+            "category",
+            "jira_created_at",
+        ),
+        Index(
+            "ix_tickets_project_category",
+            "project_key",
+            "category",
+        ),
+        Index(
+            "ix_tickets_category_status",
+            "category",
+            "status",
+        ),
+        Index(
+            "ix_tickets_category_priority",
+            "category",
+            "priority",
+        ),
+    )
+
+    # Jira's issue ID is the stable primary identifier.
+    jira_issue_id: Mapped[str] = mapped_column(
+        String(64),
+        primary_key=True,
+    )
+
+    jira_key: Mapped[str] = mapped_column(
+        String(64),
+        unique=True,
+        nullable=False,
+    )
+
+    project_key: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        index=True,
+    )
+
+    jira_url: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+    )
+
+    summary: Mapped[str | None] = mapped_column(Text)
+
+    description: Mapped[str | None] = mapped_column(Text)
+
+    category: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+    )
+
+    status: Mapped[str | None] = mapped_column(String(255))
+
+    priority: Mapped[str | None] = mapped_column(String(255))
+
+    issue_type: Mapped[str | None] = mapped_column(String(255))
+
+    assignee_id: Mapped[str | None] = mapped_column(String(255))
+
+    assignee_name: Mapped[str | None] = mapped_column(String(255))
+
+    reporter_id: Mapped[str | None] = mapped_column(String(255))
+
+    reporter_name: Mapped[str | None] = mapped_column(String(255))
+
+    jira_created_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+    )
+
+    jira_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+    )
+
+    indexed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+
+========== app/models/sync_state.py ==========
+
+"""Tracks Jira project synchronization progress."""
+
+from __future__ import annotations
+
+from datetime import datetime
+
+from sqlalchemy import DateTime, Integer, String, Text, func
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.models.base import Base
+
+
+class SyncState(Base):
+    __tablename__ = "sync_states"
+
+    project_key: Mapped[str] = mapped_column(
+        String(32),
+        primary_key=True,
+    )
+
+    sync_status: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="pending",
+    )
+
+    last_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+    )
+
+    last_completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+    )
+
+    last_error: Mapped[str | None] = mapped_column(Text)
+
+    total_indexed: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default="0",
+    )
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
+========== app/models/base.py ==========
+
+"""Base class for SQLAlchemy database models."""
+
+from sqlalchemy.orm import DeclarativeBase
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+========== app/core/config.py ==========
+"""Application configuration, loaded from environment variables / backend/.env."""
+from __future__ import annotations
+
+import os
+import re
+from dataclasses import dataclass, field
+from functools import lru_cache
+from pathlib import Path
+from urllib.parse import urlparse
+
+from dotenv import load_dotenv
+
+PROJECT_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,19}$")
+BACKEND_DIR = Path(__file__).resolve().parents[2]
+
+
+@dataclass(frozen=True)
+class Settings:
+    jira_base_url: str = ""
+    jira_email: str = ""
+    jira_api_token: str = field(default="", repr=False)  # never printed
+    jira_project_keys: tuple[str, ...] = ()
+    app_env: str = "development"
+    log_level: str = "INFO"
+    frontend_origins: tuple[str, ...] = ("http://localhost:5173",)
+    cache_ttl_seconds: int = 60
+    jira_timeout_seconds: float = 20.0
+    jira_max_retries: int = 3
+    jira_retry_backoff_seconds: float = 0.5
+    default_page_size: int = 25
+    max_page_size: int = 100
+    stats_page_size: int = 1000
+    key_page_size: int = 1000
+    detail_page_size: int = 100
+    project_meta_ttl_seconds: int = 300
+    version: str = "1.0.0"
+    database_url: str = field(default="", repr=False)
+
+    @property
+    def is_production(self) -> bool:
+        return self.app_env == "production"
+
+    @property
+    def jira_host(self) -> str:
+        return urlparse(self.jira_base_url).netloc
+
+    def config_problems(self) -> list[str]:
+        """Human readable list of what is wrong with the configuration."""
+        problems: list[str] = []
+        if not self.jira_base_url:
+            problems.append("JIRA_BASE_URL is not set")
+        else:
+            parsed = urlparse(self.jira_base_url)
+            if parsed.scheme not in ("http", "https") or not parsed.netloc:
+                problems.append("JIRA_BASE_URL must look like https://your-company.atlassian.net")
+            elif self.is_production and parsed.scheme != "https":
+                problems.append("JIRA_BASE_URL must use https in production")
+        if not self.jira_email:
+            problems.append("JIRA_EMAIL is not set")
+        elif "@" not in self.jira_email:
+            problems.append("JIRA_EMAIL must be a valid email address")
+        if not self.jira_api_token:
+            problems.append("JIRA_API_TOKEN is not set")
+        
+        for key in self.jira_project_keys:
+            if not PROJECT_KEY_RE.match(key):
+                problems.append(f"'{key}' in JIRA_PROJECT_KEYS is not a valid Jira project key")
+        return problems
+
+
+def _csv(value: str) -> tuple[str, ...]:
+    return tuple(part.strip() for part in value.split(",") if part.strip())
+
+
+def _int(name: str, default: int, minimum: int = 0) -> int:
+    raw = os.getenv(name, "").strip()
+    try:
+        return max(minimum, int(raw)) if raw else default
+    except ValueError:
+        return default
+
+
+def _float(name: str, default: float, minimum: float = 1.0) -> float:
+    raw = os.getenv(name, "").strip()
+    try:
+        return max(minimum, float(raw)) if raw else default
+    except ValueError:
+        return default
+
+
+def normalize_base_url(raw: str) -> str:
+    """Reduce any pasted Jira URL (e.g. .../browse/TDF-1) to scheme://host."""
+    raw = raw.strip()
+    if raw and "://" not in raw:
+        raw = "https://" + raw
+    parsed = urlparse(raw)
+    if not parsed.scheme or not parsed.netloc:
+        return raw.rstrip("/")
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def load_settings() -> Settings:
+    load_dotenv(BACKEND_DIR / ".env", override=False)
+    return Settings(
+        jira_base_url=normalize_base_url(os.getenv("JIRA_BASE_URL", "")),
+        jira_email=os.getenv("JIRA_EMAIL", "").strip(),
+        jira_api_token=os.getenv("JIRA_API_TOKEN", "").strip(),
+      jira_project_keys=tuple(
+    k.upper() for k in _csv(os.getenv("JIRA_PROJECT_KEYS", ""))
+),
+        app_env=os.getenv("APP_ENV", "development").strip().lower(),
+        log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper(),
+        frontend_origins=_csv(os.getenv("FRONTEND_ORIGINS", "http://localhost:5173")),
+        cache_ttl_seconds=_int("CACHE_TTL_SECONDS", 60),
+        jira_timeout_seconds=_float("JIRA_TIMEOUT_SECONDS", 20.0),
+        jira_max_retries=_int("JIRA_MAX_RETRIES", 3),
+        default_page_size=_int("DEFAULT_PAGE_SIZE", 25, 1),
+        max_page_size=_int("MAX_PAGE_SIZE", 100, 1),
+        database_url=os.getenv("DATABASE_URL", "").strip(),
+    )
+
+
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    return load_settings()
+
+
+========== app/core/database.py ==========
+
+"""Asynchronous PostgreSQL database connection management."""
+
+from __future__ import annotations
+
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
+
+
+class Database:
+    """Owns the SQLAlchemy async engine and session factory."""
+
+    def __init__(self, database_url: str) -> None:
+        if not database_url:
+            raise ValueError("DATABASE_URL is required.")
+
+        self.engine: AsyncEngine = create_async_engine(
+            database_url,
+            pool_pre_ping=True,
+            pool_size=5,
+            max_overflow=10,
+            pool_timeout=30,
+            pool_recycle=1800,
+        )
+
+        self.session_factory = async_sessionmaker(
+            bind=self.engine,
+            class_=AsyncSession,
+            expire_on_commit=False,
+        )
+
+    async def close(self) -> None:
+        """Dispose of all database connections."""
+        await self.engine.dispose()
+

@@ -1,0 +1,51 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --amethyst: #9966cc;
+  --rich-plum-pink: #8e4585;
+  --soft-cream: #fff7e8;
+  --golden-sand: #d8b56d;
+  --ink: #2b1f33;
+  --line: #e8dcc6;
+}
+
+@layer base {
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    @apply bg-cream-100 font-sans text-ink antialiased;
+    font-feature-settings: "tnum" 1;
+  }
+  :focus-visible { outline: 2px solid var(--amethyst); outline-offset: 2px; border-radius: 6px; }
+  ::selection { background: #ebddf7; }
+}
+
+@layer components {
+  .card { @apply rounded-2xl border border-line bg-cream-50 shadow-card; }
+  .field-label { @apply mb-1 block text-xs font-medium text-ink-soft; }
+  .field {
+    @apply w-full rounded-lg border border-line bg-white px-3 py-2 text-sm text-ink
+      placeholder:text-ink-faint transition-colors hover:border-sand-400
+      focus:border-amethyst-500 focus:outline-none focus:ring-2 focus:ring-amethyst-200
+      disabled:cursor-not-allowed disabled:opacity-60;
+  }
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-lg px-3.5 py-2 text-sm font-medium
+      transition-colors disabled:cursor-not-allowed disabled:opacity-55;
+  }
+  .btn-primary { @apply btn bg-amethyst-600 text-white hover:bg-amethyst-700; }
+  .btn-secondary { @apply btn border border-line bg-white text-ink hover:border-sand-500 hover:bg-sand-100; }
+  .btn-ghost { @apply btn text-ink-soft hover:bg-sand-100; }
+
+  /* Status badges are tinted by Jira's own status category, never by status name. */
+  .badge { @apply inline-flex items-center gap-1.5 whitespace-nowrap rounded-full px-2.5 py-0.5 text-xs font-medium; }
+  .badge-new { background: #f7ebd0; color: #6f5220; }
+  .badge-indeterminate { background: #ebddf7; color: #4d2f70; }
+  .badge-done { background: #f3e2f1; color: #5f2d5a; }
+  .badge-unknown { background: #eee8f0; color: #5e4f68; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+}

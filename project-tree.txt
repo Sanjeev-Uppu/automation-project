@@ -1,0 +1,99 @@
+﻿PROJECT STRUCTURE: auto-project
++-- [DIR] backend
+|   +-- [DIR] app
+|   |   +-- [DIR] api
+|   |   |   +-- __init__.py
+|   |   |   \-- routes.py
+|   |   +-- [DIR] core
+|   |   |   +-- __init__.py
+|   |   |   +-- cache.py
+|   |   |   +-- config.py
+|   |   |   +-- errors.py
+|   |   |   \-- logging.py
+|   |   +-- [DIR] integrations
+|   |   |   +-- __init__.py
+|   |   |   \-- jira_client.py
+|   |   +-- [DIR] models
+|   |   |   \-- __init__.py
+|   |   +-- [DIR] schemas
+|   |   |   +-- __init__.py
+|   |   |   \-- models.py
+|   |   +-- [DIR] services
+|   |   |   +-- __init__.py
+|   |   |   +-- jira_service.py
+|   |   |   +-- jql.py
+|   |   |   \-- normalizer.py
+|   |   +-- [DIR] utils
+|   |   |   \-- __init__.py
+|   |   +-- __init__.py
+|   |   \-- main.py
+|   +-- [DIR] tests
+|   |   +-- __init__.py
+|   |   +-- conftest.py
+|   |   +-- test_api.py
+|   |   +-- test_jira_client.py
+|   |   \-- test_jql.py
+|   +-- .dockerignore
+|   +-- .env.example
+|   +-- Dockerfile
+|   +-- pytest.ini
+|   +-- requirements.txt
+|   +-- requirements-dev.txt
+|   \-- run.py
++-- [DIR] frontend
+|   +-- [DIR] public
+|   |   \-- favicon.svg
+|   +-- [DIR] src
+|   |   +-- [DIR] assets
+|   |   +-- [DIR] components
+|   |   |   +-- Charts.tsx
+|   |   |   +-- ConnectionStatus.tsx
+|   |   |   +-- ErrorBoundary.tsx
+|   |   |   +-- ErrorState.tsx
+|   |   |   +-- Filters.tsx
+|   |   |   +-- IssueTable.tsx
+|   |   |   +-- Pagination.tsx
+|   |   |   +-- ProjectOverview.tsx
+|   |   |   +-- Skeleton.tsx
+|   |   |   +-- StatCard.tsx
+|   |   |   \-- StatusBadge.tsx
+|   |   +-- [DIR] context
+|   |   |   \-- AppContext.tsx
+|   |   +-- [DIR] hooks
+|   |   |   +-- useAsyncData.ts
+|   |   |   \-- useDebounced.ts
+|   |   +-- [DIR] layouts
+|   |   |   \-- AppLayout.tsx
+|   |   +-- [DIR] pages
+|   |   |   +-- OverviewPage.tsx
+|   |   |   \-- ProjectPage.tsx
+|   |   +-- [DIR] services
+|   |   |   \-- api.ts
+|   |   +-- [DIR] styles
+|   |   |   \-- index.css
+|   |   +-- [DIR] test
+|   |   |   +-- app.test.tsx
+|   |   |   \-- setup.ts
+|   |   +-- [DIR] types
+|   |   |   \-- api.ts
+|   |   +-- [DIR] utils
+|   |   |   +-- colors.ts
+|   |   |   +-- errors.ts
+|   |   |   \-- format.ts
+|   |   +-- App.tsx
+|   |   +-- main.tsx
+|   |   \-- vite-env.d.ts
+|   +-- .dockerignore
+|   +-- .env.example
+|   +-- Dockerfile
+|   +-- index.html
+|   +-- nginx.conf
+|   +-- package.json
+|   +-- package-lock.json
+|   +-- postcss.config.js
+|   +-- tailwind.config.js
+|   +-- tsconfig.json
+|   \-- vite.config.ts
++-- .gitignore
++-- docker-compose.yml
+\-- README.md
