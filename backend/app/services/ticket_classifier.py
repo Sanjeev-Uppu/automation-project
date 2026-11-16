@@ -1,5 +1,6 @@
 
 """Classify Jira tickets into Manual and Automation categories."""
+
 from __future__ import annotations
 
 import re
@@ -11,25 +12,22 @@ class TicketCategory(StrEnum):
     AUTOMATION = "automation"
 
 
-# Match "automation" as a complete word, case-insensitively.
-# This includes descriptions such as "Automation Bug" and
-# "Automation testing" without matching unrelated substrings.
+# Match Automation in any letter case.
 _AUTOMATION_PATTERN = re.compile(r"\bautomation\b", re.IGNORECASE)
 
 
-def classify_ticket(description: str | None) -> TicketCategory:
+def classify_ticket(summary: str | None) -> TicketCategory:
     """
-    Classify a ticket using its extracted description text.
+    Classify tickets using Jira summary only.
 
-    Rules:
-    - Contains the word "Automation" -> Automation
-    - Missing or empty description -> Manual
-    - Otherwise -> Manual
+    Any case variation of the complete word "Automation"
+    is classified as Automation.
     """
-    if not description:
+
+    if not summary or not summary.strip():
         return TicketCategory.MANUAL
 
-    if _AUTOMATION_PATTERN.search(description):
+    if _AUTOMATION_PATTERN.search(summary):
         return TicketCategory.AUTOMATION
 
     return TicketCategory.MANUAL

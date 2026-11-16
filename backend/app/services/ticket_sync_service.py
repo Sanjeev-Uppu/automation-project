@@ -233,7 +233,7 @@ class TicketSyncService:
             self.client.settings.jira_base_url,
         )
 
-        category = classify_ticket(issue.description)
+        category = classify_ticket(issue.summary)
 
         assignee = issue.assignee
         reporter = issue.reporter
