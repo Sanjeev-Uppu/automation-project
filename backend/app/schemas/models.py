@@ -210,6 +210,7 @@ class TestingProjectSyncStatus(BaseModel):
     last_completed_at: datetime | None = None
     last_error: str | None = None
     updated_at: datetime | None = None
+    creator: Person | None = None
 
 
 class TestingSyncStatusResponse(BaseModel):

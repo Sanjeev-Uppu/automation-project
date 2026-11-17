@@ -94,6 +94,11 @@ class Ticket(Base):
 
     reporter_name: Mapped[str | None] = mapped_column(String(255))
 
+    # Original Jira ticket creator.
+    creator_id: Mapped[str | None] = mapped_column(String(255))
+
+    creator_name: Mapped[str | None] = mapped_column(String(255))
+
     jira_created_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
     )

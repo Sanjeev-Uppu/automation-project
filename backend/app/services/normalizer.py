@@ -1,5 +1,6 @@
 
 """Convert raw Jira issue JSON into our schemas. Missing data stays None."""
+
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -72,6 +73,7 @@ def normalize_issue(raw: dict[str, Any], base_url: str) -> Issue:
         status=_status(fields.get("status")),
         assignee=_person(fields.get("assignee")),
         reporter=_person(fields.get("reporter")),
+        creator=_person(fields.get("creator")),
         issue_type=_named(fields.get("issuetype")),
         priority=_named(fields.get("priority")),
         created=parse_jira_datetime(fields.get("created")),

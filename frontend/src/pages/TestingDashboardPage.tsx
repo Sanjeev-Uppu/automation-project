@@ -1,3 +1,4 @@
+
 import {
     useEffect,
     useState,
@@ -35,6 +36,10 @@ interface TicketFilters {
     page: number;
     page_size: number;
 }
+
+type TestingTicketWithReporter = TestingTicket & {
+    reporter_name?: string | null;
+};
 
 const emptyFilters: TicketFilters = {
     search: "",
@@ -359,8 +364,8 @@ export default function TestingDashboardPage() {
                         type="button"
                         onClick={() => setCategory("manual")}
                         className={`rounded-lg px-4 py-2 text-sm font-medium ${category === "manual"
-                            ? "bg-plum-900 text-white"
-                            : "bg-cream-100 text-ink-soft hover:bg-sand-100"
+                                ? "bg-plum-900 text-white"
+                                : "bg-cream-100 text-ink-soft hover:bg-sand-100"
                             }`}
                     >
                         Manual Testing ({summary?.manual ?? 0})
@@ -370,8 +375,8 @@ export default function TestingDashboardPage() {
                         type="button"
                         onClick={() => setCategory("automation")}
                         className={`rounded-lg px-4 py-2 text-sm font-medium ${category === "automation"
-                            ? "bg-plum-900 text-white"
-                            : "bg-cream-100 text-ink-soft hover:bg-sand-100"
+                                ? "bg-plum-900 text-white"
+                                : "bg-cream-100 text-ink-soft hover:bg-sand-100"
                             }`}
                     >
                         Automation Testing ({summary?.automation ?? 0})
@@ -461,7 +466,7 @@ export default function TestingDashboardPage() {
                 </form>
 
                 <div className="overflow-x-auto">
-                    <table className="w-full min-w-[850px] text-left text-sm">
+                    <table className="w-full min-w-[1000px] text-left text-sm">
                         <thead className="border-b border-line bg-cream-100 text-ink-soft">
                             <tr>
                                 <th className="px-3 py-3 font-medium">Ticket</th>
@@ -470,6 +475,7 @@ export default function TestingDashboardPage() {
                                 <th className="px-3 py-3 font-medium">Status</th>
                                 <th className="px-3 py-3 font-medium">Priority</th>
                                 <th className="px-3 py-3 font-medium">Assignee</th>
+                                <th className="px-3 py-3 font-medium">Created By</th>
                                 <th className="px-3 py-3 font-medium">Created</th>
                             </tr>
                         </thead>
@@ -478,49 +484,68 @@ export default function TestingDashboardPage() {
                             {loading ? (
                                 <tr>
                                     <td
-                                        colSpan={7}
+                                        colSpan={8}
                                         className="px-3 py-10 text-center text-ink-soft"
                                     >
                                         Loading tickets...
                                     </td>
                                 </tr>
                             ) : ticketPage?.items.length ? (
-                                ticketPage.items.map((ticket: TestingTicket) => (
-                                    <tr
-                                        key={ticket.jira_issue_id}
-                                        className="hover:bg-cream-100/70"
-                                    >
-                                        <td className="px-3 py-3">
-                                            <a
-                                                href={ticket.jira_url}
-                                                target="_blank"
-                                                rel="noreferrer"
-                                                className="inline-flex items-center gap-1 font-medium text-plum-800 hover:underline"
-                                            >
-                                                {ticket.jira_key}
-                                                <ExternalLink className="h-3 w-3" />
-                                            </a>
-                                        </td>
+                                ticketPage.items.map((ticket: TestingTicket) => {
+                                    const ticketWithReporter =
+                                        ticket as TestingTicketWithReporter;
 
-                                        <td className="max-w-xs px-3 py-3 text-ink">
-                                            {ticket.summary || "—"}
-                                        </td>
+                                    return (
+                                        <tr
+                                            key={ticket.jira_issue_id}
+                                            className="hover:bg-cream-100/70"
+                                        >
+                                            <td className="px-3 py-3">
+                                                <a
+                                                    href={ticket.jira_url}
+                                                    target="_blank"
+                                                    rel="noreferrer"
+                                                    className="inline-flex items-center gap-1 font-medium text-plum-800 hover:underline"
+                                                >
+                                                    {ticket.jira_key}
+                                                    <ExternalLink className="h-3 w-3" />
+                                                </a>
+                                            </td>
 
-                                        <td className="px-3 py-3">{ticket.project_key}</td>
-                                        <td className="px-3 py-3">{ticket.status || "—"}</td>
-                                        <td className="px-3 py-3">{ticket.priority || "—"}</td>
-                                        <td className="px-3 py-3">
-                                            {ticket.assignee_name || "Unassigned"}
-                                        </td>
-                                        <td className="px-3 py-3">
-                                            {formatDate(ticket.jira_created_at)}
-                                        </td>
-                                    </tr>
-                                ))
+                                            <td className="max-w-xs px-3 py-3 text-ink">
+                                                {ticket.summary || "—"}
+                                            </td>
+
+                                            <td className="px-3 py-3">
+                                                {ticket.project_key}
+                                            </td>
+
+                                            <td className="px-3 py-3">
+                                                {ticket.status || "—"}
+                                            </td>
+
+                                            <td className="px-3 py-3">
+                                                {ticket.priority || "—"}
+                                            </td>
+
+                                            <td className="px-3 py-3">
+                                                {ticket.assignee_name || "Unassigned"}
+                                            </td>
+
+                                            <td className="px-3 py-3">
+                                                {ticketWithReporter.reporter_name || "—"}
+                                            </td>
+
+                                            <td className="px-3 py-3">
+                                                {formatDate(ticket.jira_created_at)}
+                                            </td>
+                                        </tr>
+                                    );
+                                })
                             ) : (
                                 <tr>
                                     <td
-                                        colSpan={7}
+                                        colSpan={8}
                                         className="px-3 py-10 text-center text-ink-soft"
                                     >
                                         No {category} tickets found.

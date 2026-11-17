@@ -8,7 +8,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import delete, func
+from sqlalchemy import delete
 from sqlalchemy.dialects.postgresql import insert
 
 from app.core.database import Database
@@ -18,12 +18,13 @@ from app.models.ticket import Ticket
 from app.services.normalizer import normalize_issue
 from app.services.ticket_classifier import classify_ticket
 
+
 logger = logging.getLogger(__name__)
 
 BATCH_SIZE = 250
 
 ISSUE_FIELDS = (
-    "summary,description,status,assignee,reporter,"
+    "summary,description,status,assignee,reporter,creator,"
     "issuetype,priority,created,updated"
 )
 
@@ -59,7 +60,9 @@ class TicketSyncService:
             results: list[dict[str, Any]] = []
 
             for project in projects:
-                project_key = str(project.get("key") or "").strip().upper()
+                project_key = str(
+                    project.get("key") or ""
+                ).strip().upper()
 
                 if not project_key:
                     continue
@@ -102,6 +105,7 @@ class TicketSyncService:
             completed = sum(
                 item["status"] == "completed" for item in results
             )
+
             failed = sum(
                 item["status"] == "failed" for item in results
             )
@@ -207,6 +211,7 @@ class TicketSyncService:
                     error=str(exc)[:4000],
                     total=indexed,
                 )
+
             except Exception:
                 logger.exception(
                     "Could not update failed sync state for %s",
@@ -233,6 +238,7 @@ class TicketSyncService:
             self.client.settings.jira_base_url,
         )
 
+        # Preserve the existing Summary-based classification.
         category = classify_ticket(issue.summary)
 
         assignee = issue.assignee
@@ -240,6 +246,28 @@ class TicketSyncService:
         status = issue.status
         priority = issue.priority
         issue_type = issue.issue_type
+
+        # Extract the original creator directly from Jira's raw response.
+        # This avoids requiring a change to the existing Issue schema.
+        fields = raw_issue.get("fields") or {}
+        creator_data = fields.get("creator")
+
+        creator_id = None
+        creator_name = None
+
+        if isinstance(creator_data, dict):
+            creator_id = creator_data.get("accountId")
+
+            creator_name = (
+                creator_data.get("displayName")
+                or creator_data.get("emailAddress")
+            )
+
+            if creator_id is not None:
+                creator_id = str(creator_id)
+
+            if creator_name is not None:
+                creator_name = str(creator_name)
 
         return {
             "jira_issue_id": str(issue.id),
@@ -256,6 +284,8 @@ class TicketSyncService:
             "assignee_name": assignee.display_name if assignee else None,
             "reporter_id": reporter.account_id if reporter else None,
             "reporter_name": reporter.display_name if reporter else None,
+            "creator_id": creator_id,
+            "creator_name": creator_name,
             "jira_created_at": issue.created,
             "jira_updated_at": issue.updated,
         }
@@ -291,6 +321,8 @@ class TicketSyncService:
             "assignee_name",
             "reporter_id",
             "reporter_name",
+            "creator_id",
+            "creator_name",
             "jira_created_at",
             "jira_updated_at",
             "indexed_at",
