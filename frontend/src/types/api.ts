@@ -230,3 +230,11 @@ export interface TestingSyncResult {
     error?: string | null;
   }>;
 }
+
+// ==========================================
+// Ticket Bookmark Types
+// ==========================================
+
+export interface BookmarkResponse {
+  items: TestingTicket[];
+}

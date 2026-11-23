@@ -11,19 +11,15 @@ from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.core.config import get_settings
-from app.models import Base, Ticket, SyncState  # noqa: F401
+from app.models import Base, Ticket, SyncState, User, TicketBookmark  # noqa: F401
 
-from app.models.base import Base
-from app.models.user import User
-
-target_metadata = Base.metadata
 
 config = context.config
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# Load all registered SQLAlchemy models for migration generation.
+# Register all models with SQLAlchemy metadata for migrations.
 target_metadata = Base.metadata
 
 
@@ -42,7 +38,6 @@ def get_database_url() -> str:
 
 def run_migrations_offline() -> None:
     """Generate SQL migrations without opening a database connection."""
-
     context.configure(
         url=get_database_url(),
         target_metadata=target_metadata,
@@ -58,7 +53,6 @@ def run_migrations_offline() -> None:
 
 def do_run_migrations(connection) -> None:
     """Run migrations using a synchronous connection adapter."""
-
     context.configure(
         connection=connection,
         target_metadata=target_metadata,
@@ -72,7 +66,6 @@ def do_run_migrations(connection) -> None:
 
 async def run_async_migrations() -> None:
     """Run migrations using an asynchronous PostgreSQL connection."""
-
     engine = create_async_engine(
         get_database_url(),
         poolclass=pool.NullPool,
@@ -87,7 +80,6 @@ async def run_async_migrations() -> None:
 
 def run_migrations_online() -> None:
     """Run migrations in online mode."""
-
     asyncio.run(run_async_migrations())
 
 

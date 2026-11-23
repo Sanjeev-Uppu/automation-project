@@ -12,6 +12,7 @@ import RegisterPage from "./pages/RegisterPage";
 import OverviewPage from "./pages/OverviewPage";
 import ProjectPage from "./pages/ProjectPage";
 import TestingDashboardPage from "./pages/TestingDashboardPage";
+import ManualScriptsPage from "./pages/ManualScriptsPage";
 
 export default function App() {
   return (
@@ -25,13 +26,35 @@ export default function App() {
           {/* Protected application routes */}
           <Route element={<ProtectedRoute />}>
             <Route element={<AppLayout />}>
-              <Route index element={<OverviewPage />} />
-              <Route path="projects/:key" element={<ProjectPage />} />
+              {/* Main overview */}
+              <Route
+                index
+                element={<OverviewPage />}
+              />
+
+              {/* Project details */}
+              <Route
+                path="projects/:key"
+                element={<ProjectPage />}
+              />
+
+              {/* Testing dashboard */}
               <Route
                 path="testing-dashboard"
                 element={<TestingDashboardPage />}
               />
-              <Route path="*" element={<OverviewPage />} />
+
+              {/* Manual ticket scripts dashboard */}
+              <Route
+                path="manual-scripts"
+                element={<ManualScriptsPage />}
+              />
+
+              {/* Fallback route */}
+              <Route
+                path="*"
+                element={<OverviewPage />}
+              />
             </Route>
           </Route>
         </Routes>

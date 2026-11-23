@@ -12,6 +12,7 @@ import type {
   TestingSyncResult,
   TestingSyncStatusResponse,
   TestingTicketPage,
+  BookmarkResponse,
 } from "../types/api";
 
 const BASE =
@@ -123,6 +124,93 @@ async function get<T>(
 
   if (!res.ok) {
     throw await toApiError(res);
+  }
+
+  return (await res.json()) as T;
+}
+
+// -----------------------------------------------------------------------------
+// Bookmark API helpers
+// -----------------------------------------------------------------------------
+
+/**
+ * Read the CSRF token from the readable cookie.
+ * The access token remains HttpOnly and is never accessed by JavaScript.
+ */
+function getCsrfToken(): string | null {
+  const cookie = document.cookie
+    .split("; ")
+    .find((item) => item.startsWith("csrf_token="));
+
+  if (!cookie) {
+    return null;
+  }
+
+  return decodeURIComponent(cookie.substring("csrf_token=".length));
+}
+
+/**
+ * Send authenticated bookmark requests.
+ * GET is read-only. POST and DELETE include the CSRF token.
+ */
+async function bookmarkRequest<T>(
+  path: string,
+  method: "GET" | "POST" | "DELETE",
+  signal?: AbortSignal,
+): Promise<T> {
+  const headers: Record<string, string> = {
+    Accept: "application/json",
+  };
+
+  if (method === "POST" || method === "DELETE") {
+    const csrfToken = getCsrfToken();
+
+    if (!csrfToken) {
+      throw new ApiError(
+        "csrf_token_missing",
+        "Your security token is missing. Please refresh the page and try again.",
+        403,
+      );
+    }
+
+    headers["X-CSRF-Token"] = csrfToken;
+  }
+
+  let res: Response;
+
+  try {
+    res = await fetch(`${BASE}/api${path}`, {
+      method,
+      credentials: "include",
+      headers,
+      signal,
+    });
+  } catch (err) {
+    if ((err as Error).name === "AbortError") {
+      throw err;
+    }
+
+    throw new ApiError(
+      "network_error",
+      "Could not connect to the backend.",
+      0,
+      "Make sure the backend is running and try again.",
+    );
+  }
+
+  if (!res.ok) {
+    throw await toApiError(res);
+  }
+
+  // DELETE endpoints may return HTTP 204 with no response body.
+  if (res.status === 204) {
+    return undefined as T;
+  }
+
+  const contentType = res.headers.get("Content-Type") ?? "";
+
+  if (!contentType.includes("application/json")) {
+    return undefined as T;
   }
 
   return (await res.json()) as T;
@@ -319,4 +407,36 @@ export const api = {
 
     return (await res.json()) as TestingSyncResult;
   },
+
+  // ---------------------------------------------------------------------------
+  // Ticket Bookmark APIs
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Get all tickets bookmarked by the currently authenticated user.
+   */
+  bookmarks: (signal?: AbortSignal) =>
+    bookmarkRequest<BookmarkResponse>(
+      "/bookmarks",
+      "GET",
+      signal,
+    ),
+
+  /**
+   * Bookmark a ticket for the currently authenticated user.
+   */
+  addBookmark: (jiraIssueId: string) =>
+    bookmarkRequest<void>(
+      `/bookmarks/${encodeURIComponent(jiraIssueId)}`,
+      "POST",
+    ),
+
+  /**
+   * Remove a ticket from the currently authenticated user's bookmarks.
+   */
+  removeBookmark: (jiraIssueId: string) =>
+    bookmarkRequest<void>(
+      `/bookmarks/${encodeURIComponent(jiraIssueId)}`,
+      "DELETE",
+    ),
 };

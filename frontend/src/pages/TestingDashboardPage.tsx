@@ -22,6 +22,8 @@ import {
 } from "lucide-react";
 
 import { api, ApiError } from "../services/api";
+import { useBookmarks } from "../hooks/useBookmarks";
+import { BookmarkButton } from "../components/BookmarkButton";
 
 import type {
     TestingCategory,
@@ -537,6 +539,13 @@ function createReportHtml(
 // --------------------------------------------------
 
 export default function TestingDashboardPage() {
+    const {
+        isBookmarked,
+        toggleBookmark,
+        pendingIds,
+        error: bookmarkError,
+    } = useBookmarks();
+
     const [category, setCategory] =
         useState<TestingCategory>("manual");
 
@@ -1050,6 +1059,16 @@ export default function TestingDashboardPage() {
                 </div>
             </div>
 
+            {/* Bookmark error message */}
+            {bookmarkError && (
+                <div
+                    role="alert"
+                    className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700"
+                >
+                    {bookmarkError}
+                </div>
+            )}
+
             {/* Error message */}
             {error && (
                 <div
@@ -1100,8 +1119,8 @@ export default function TestingDashboardPage() {
                         type="button"
                         onClick={() => setCategory("manual")}
                         className={`rounded-lg px-4 py-2 text-sm font-medium ${category === "manual"
-                                ? "bg-plum-900 text-white"
-                                : "bg-cream-100 text-ink-soft hover:bg-sand-100"
+                            ? "bg-plum-900 text-white"
+                            : "bg-cream-100 text-ink-soft hover:bg-sand-100"
                             }`}
                     >
                         Manual Testing ({summary?.manual ?? 0})
@@ -1111,8 +1130,8 @@ export default function TestingDashboardPage() {
                         type="button"
                         onClick={() => setCategory("automation")}
                         className={`rounded-lg px-4 py-2 text-sm font-medium ${category === "automation"
-                                ? "bg-plum-900 text-white"
-                                : "bg-cream-100 text-ink-soft hover:bg-sand-100"
+                            ? "bg-plum-900 text-white"
+                            : "bg-cream-100 text-ink-soft hover:bg-sand-100"
                             }`}
                     >
                         Automation Testing ({summary?.automation ?? 0})
@@ -1233,6 +1252,7 @@ export default function TestingDashboardPage() {
                                 <th className="px-3 py-3 font-medium">Assignee</th>
                                 <th className="px-3 py-3 font-medium">Created By</th>
                                 <th className="px-3 py-3 font-medium">Created</th>
+                                <th className="px-3 py-3 text-center font-medium">Bookmark</th>
                             </tr>
                         </thead>
 
@@ -1240,7 +1260,7 @@ export default function TestingDashboardPage() {
                             {loading ? (
                                 <tr>
                                     <td
-                                        colSpan={8}
+                                        colSpan={9}
                                         className="px-3 py-10 text-center text-ink-soft"
                                     >
                                         Loading tickets...
@@ -1295,13 +1315,21 @@ export default function TestingDashboardPage() {
                                             <td className="px-3 py-3">
                                                 {formatDate(ticket.jira_created_at)}
                                             </td>
+
+                                            <td className="px-3 py-3 text-center">
+                                                <BookmarkButton
+                                                    bookmarked={isBookmarked(ticket.jira_issue_id)}
+                                                    loading={pendingIds.includes(ticket.jira_issue_id)}
+                                                    onClick={() => void toggleBookmark(ticket)}
+                                                />
+                                            </td>
                                         </tr>
                                     );
                                 })
                             ) : (
                                 <tr>
                                     <td
-                                        colSpan={8}
+                                        colSpan={9}
                                         className="px-3 py-10 text-center text-ink-soft"
                                     >
                                         No {category} tickets found.

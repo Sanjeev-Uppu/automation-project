@@ -13,6 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.api.routes import router
+from app.api.bookmark_routes import router as bookmark_router
 from app.core.cache import TTLCache
 from app.core.config import Settings, get_settings
 from app.core.database import Database
@@ -145,7 +146,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         CORSMiddleware,
         allow_origins=list(settings.frontend_origins),
         allow_credentials=True,
-        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_methods=[
+            "GET",
+            "POST",
+            "DELETE",
+            "OPTIONS",
+        ],
         allow_headers=[
             "Accept",
             "Content-Type",
@@ -235,6 +241,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     # Register existing Jira API routes.
     app.include_router(router, prefix="/api")
+
+    # Register bookmark routes.
+    app.include_router(
+        bookmark_router,
+        prefix="/api",
+        tags=["Bookmarks"],
+    )
 
     # Preserve the existing versioned API routes.
     app.include_router(
